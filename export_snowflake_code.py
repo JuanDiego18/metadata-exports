@@ -72,6 +72,24 @@ def write_sql(out_dir: pathlib.Path, fn: str, sql: str):
     ensure_dir(p.parent)
     p.write_text(sql, encoding="utf-8")
 
+
+def log_extracted(obj_type: str, fq_name: str, rel_path: pathlib.Path, verbose: bool = True):
+    """Log that a DDL was successfully extracted (for user visibility)."""
+    if verbose:
+        print(f"  [DDL] {obj_type}: {fq_name} -> {rel_path}")
+
+
+def print_extraction_summary(by_type: Dict[str, List[str]], db: str, schema: str):
+    """Print a short summary of what was extracted for a given db.schema."""
+    if not by_type:
+        print(f"  [SUMMARY] {db}.{schema}: no DDL extracted")
+        return
+    lines = [f"  [SUMMARY] {db}.{schema}:"]
+    for obj_type in sorted(by_type.keys()):
+        names = by_type[obj_type]
+        lines.append(f"    {obj_type}: {len(names)} — {', '.join(names[:5])}{' ...' if len(names) > 5 else ''}")
+    print("\n".join(lines))
+
 def connect(args):
     password = os.environ.get(args.password_env) if args.password_env else args.password
     if not password:
@@ -133,7 +151,9 @@ def _is_timestamp_like_table_name(name: str) -> bool:
         return False
     return name[0].isdigit() and " " in name and ":" in name
 
-def export_simple_objects(cur, out_base: pathlib.Path, db: str, schema: str):
+def export_simple_objects(cur, out_base: pathlib.Path, db: str, schema: str, verbose: bool = True) -> Dict[str, List[str]]:
+    """Export tables, views, stages, etc. Returns dict mapping object type -> list of extracted FQ names."""
+    extracted: Dict[str, List[str]] = {}
     for show_sql, ddl_type, subfolder in OBJECT_EXPORTS:
         sql = show_sql.format(db=quote_ident(db), schema=quote_ident(schema))
         try:
@@ -157,8 +177,14 @@ def export_simple_objects(cur, out_base: pathlib.Path, db: str, schema: str):
             if ddl:
                 fn = f"{safe_filename_part(db)}.{safe_filename_part(schema)}.{safe_filename_part(name)}.sql"
                 write_sql(out_dir, fn, ddl)
+                rel = pathlib.Path("ddl") / subfolder / f"{safe_filename_part(db)}.{safe_filename_part(schema)}" / fn
+                log_extracted(ddl_type, fq, rel, verbose=verbose)
+                extracted.setdefault(ddl_type, []).append(fq)
+    return extracted
 
-def export_functions(cur, out_base: pathlib.Path, db: str, schema: str):
+def export_functions(cur, out_base: pathlib.Path, db: str, schema: str, verbose: bool = True) -> Dict[str, List[str]]:
+    """Export user functions. Returns dict with key 'FUNCTION' -> list of extracted FQ names."""
+    extracted: Dict[str, List[str]] = {}
     out_dir = out_base / "ddl" / "functions" / f"{safe_filename_part(db)}.{safe_filename_part(schema)}"
     ensure_dir(out_dir)
     sql = SHOW_FUNCTIONS_SQL.format(db=quote_ident(db), schema=quote_ident(schema))
@@ -166,7 +192,7 @@ def export_functions(cur, out_base: pathlib.Path, db: str, schema: str):
         cur.execute(sql)
     except Exception as e:
         print(f"[WARN] SHOW USER FUNCTIONS failed: {sql} -> {e}")
-        return
+        return extracted
     for row in cur.fetchall():
         r = row_to_dict(cur, row)
         name = r.get("name", "")
@@ -178,8 +204,14 @@ def export_functions(cur, out_base: pathlib.Path, db: str, schema: str):
             args_part = "_" + safe_filename_part(args.replace(" ", "").replace(",", "_")) if args else ""
             fn = f"{safe_filename_part(db)}.{safe_filename_part(schema)}.{safe_filename_part(name)}{args_part}.sql"
             write_sql(out_dir, fn, ddl)
+            rel = pathlib.Path("ddl") / "functions" / f"{safe_filename_part(db)}.{safe_filename_part(schema)}" / fn
+            log_extracted("FUNCTION", fqsig, rel, verbose=verbose)
+            extracted.setdefault("FUNCTION", []).append(fqsig)
+    return extracted
 
-def export_procedures(cur, out_base: pathlib.Path, db: str, schema: str):
+def export_procedures(cur, out_base: pathlib.Path, db: str, schema: str, verbose: bool = True) -> Dict[str, List[str]]:
+    """Export user procedures. Returns dict with key 'PROCEDURE' -> list of extracted FQ names."""
+    extracted: Dict[str, List[str]] = {}
     out_dir = out_base / "ddl" / "procedures" / f"{safe_filename_part(db)}.{safe_filename_part(schema)}"
     ensure_dir(out_dir)
     sql = SHOW_PROCEDURES_SQL.format(db=quote_ident(db), schema=quote_ident(schema))
@@ -187,7 +219,7 @@ def export_procedures(cur, out_base: pathlib.Path, db: str, schema: str):
         cur.execute(sql)
     except Exception as e:
         print(f"[WARN] SHOW USER PROCEDURES failed: {sql} -> {e}")
-        return
+        return extracted
     for row in cur.fetchall():
         r = row_to_dict(cur, row)
         name = r.get("name", "")
@@ -202,6 +234,10 @@ def export_procedures(cur, out_base: pathlib.Path, db: str, schema: str):
             args_part = "_" + safe_filename_part(args.replace(" ", "").replace(",", "_")) if args else ""
             fn = f"{safe_filename_part(db)}.{safe_filename_part(schema)}.{safe_filename_part(name)}{args_part}.sql"
             write_sql(out_dir, fn, ddl)
+            rel = pathlib.Path("ddl") / "procedures" / f"{safe_filename_part(db)}.{safe_filename_part(schema)}" / fn
+            log_extracted("PROCEDURE", fqsig, rel, verbose=verbose)
+            extracted.setdefault("PROCEDURE", []).append(fqsig)
+    return extracted
 
 def export_queries(
     cur, out_base: pathlib.Path, dbs: List[str], days: int, split_statements: bool = False
@@ -261,6 +297,7 @@ def parse_args():
     ap.add_argument("--export-queries", action="store_true", help="Export recent workload SQL from ACCOUNT_USAGE.query_history")
     ap.add_argument("--query-days", type=int, default=90, help="Days of query history to export (default 90)")
     ap.add_argument("--split-statements", action="store_true", help="Split workload query_text by ';' and write one statement per file (recommended for Lakebridge)")
+    ap.add_argument("--quiet", action="store_true", help="Only print per-schema summary of extracted DDL, not each object")
     return ap.parse_args()
 
 def main():
@@ -276,17 +313,29 @@ def main():
     try:
         dbs = list_databases(cur, explicit_dbs)
         print(f"[INFO] Databases: {dbs}")
+        total_by_type: Dict[str, List[str]] = {}
         for db in dbs:
             schemas = list_schemas(cur, db, explicit_schemas)
             print(f"[INFO] {db} schemas: {schemas}")
             for schema in schemas:
                 print(f"[INFO] Exporting objects from {db}.{schema} ...")
-                export_simple_objects(cur, out_base, db, schema)
-                export_functions(cur, out_base, db, schema)
-                export_procedures(cur, out_base, db, schema)
+                by_type: Dict[str, List[str]] = {}
+                verbose = not args.quiet
+                for key, names in export_simple_objects(cur, out_base, db, schema, verbose=verbose).items():
+                    by_type.setdefault(key, []).extend(names)
+                for key, names in export_functions(cur, out_base, db, schema, verbose=verbose).items():
+                    by_type.setdefault(key, []).extend(names)
+                for key, names in export_procedures(cur, out_base, db, schema, verbose=verbose).items():
+                    by_type.setdefault(key, []).extend(names)
+                print_extraction_summary(by_type, db, schema)
+                for key, names in by_type.items():
+                    total_by_type.setdefault(key, []).extend(names)
         if args.export_queries:
             export_queries(cur, out_base, dbs, args.query_days, split_statements=args.split_statements)
         print(f"[INFO] Export complete. Output at: {out_base}")
+        if total_by_type:
+            total_count = sum(len(v) for v in total_by_type.values())
+            print(f"[INFO] DDL extracted: {total_count} total — " + ", ".join(f"{k}: {len(total_by_type[k])}" for k in sorted(total_by_type.keys())))
     finally:
         try:
             cur.close()
