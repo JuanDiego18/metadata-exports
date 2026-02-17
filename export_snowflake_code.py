@@ -40,8 +40,10 @@ OBJECT_EXPORTS = [
 ]
 
 # Functions and procedures need special handling (signature)
+# Use SHOW USER PROCEDURES so we only get user-defined procedures; SHOW PROCEDURES
+# includes Snowflake system/built-in procedures (e.g. SYSTEM$*, Cortex) which GET_DDL cannot export.
 SHOW_FUNCTIONS_SQL = "SHOW USER FUNCTIONS IN SCHEMA {db}.{schema}"
-SHOW_PROCEDURES_SQL = "SHOW PROCEDURES IN SCHEMA {db}.{schema}"
+SHOW_PROCEDURES_SQL = "SHOW USER PROCEDURES IN SCHEMA {db}.{schema}"
 
 def quote_ident(name: str) -> str:
     # Always double-quote to preserve case and special chars
@@ -125,6 +127,12 @@ def safe_get_ddl(cur, obj_type: str, fqname: str) -> Optional[str]:
         print(f"[WARN] GET_DDL failed for {obj_type} {fqname}: {e}")
     return None
 
+def _is_timestamp_like_table_name(name: str) -> bool:
+    """True if name looks like a timestamp (e.g. '2026-01-29 23:56:22.491000-08:00'). Such tables often fail GET_DDL."""
+    if not name or len(name) < 10:
+        return False
+    return name[0].isdigit() and " " in name and ":" in name
+
 def export_simple_objects(cur, out_base: pathlib.Path, db: str, schema: str):
     for show_sql, ddl_type, subfolder in OBJECT_EXPORTS:
         sql = show_sql.format(db=quote_ident(db), schema=quote_ident(schema))
@@ -142,6 +150,8 @@ def export_simple_objects(cur, out_base: pathlib.Path, db: str, schema: str):
                 # Fallback to first column if name not found
                 if cur.description and len(cur.description) > 0:
                     name = str(row[0])
+            if ddl_type == "TABLE" and _is_timestamp_like_table_name(name):
+                continue  # Skip timestamp-named tables that typically fail GET_DDL
             fq = fq_name(db, schema, name)
             ddl = safe_get_ddl(cur, ddl_type, fq)
             if ddl:
@@ -176,11 +186,14 @@ def export_procedures(cur, out_base: pathlib.Path, db: str, schema: str):
     try:
         cur.execute(sql)
     except Exception as e:
-        print(f"[WARN] SHOW PROCEDURES failed: {sql} -> {e}")
+        print(f"[WARN] SHOW USER PROCEDURES failed: {sql} -> {e}")
         return
     for row in cur.fetchall():
         r = row_to_dict(cur, row)
         name = r.get("name", "")
+        # Skip Snowflake system/built-in procedures (GET_DDL does not support them)
+        if name.startswith("SYSTEM$"):
+            continue
         args = r.get("arguments", "").strip()
         sig = f"({args})" if args else "()"
         fqsig = f"{quote_ident(db)}.{quote_ident(schema)}.{quote_ident(name)}{sig}"
