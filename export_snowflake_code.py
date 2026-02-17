@@ -45,6 +45,19 @@ OBJECT_EXPORTS = [
 SHOW_FUNCTIONS_SQL = "SHOW USER FUNCTIONS IN SCHEMA {db}.{schema}"
 SHOW_PROCEDURES_SQL = "SHOW USER PROCEDURES IN SCHEMA {db}.{schema}"
 
+# GET_DDL expects signature as name(arg_types) only; SHOW returns "NAME(ARGS) RETURN type" — strip RETURN part.
+def _signature_for_get_ddl(arguments: str) -> str:
+    """Return (arg_types) for GET_DDL; strip ' RETURN return_type' and optionally normalize name(args) -> (args)."""
+    if not arguments or not arguments.strip():
+        return "()"
+    # Strip " RETURN <type>" — GET_DDL does not want return type in the identifier.
+    no_return = re.sub(r"\s+RETURN\s+.*$", "", arguments.strip(), flags=re.IGNORECASE)
+    # If result is "NAME(TYPES)", use only "(TYPES)" so we don't duplicate name when we prepend db.schema.name.
+    match = re.match(r"^[^(]*\((.+)\)\s*$", no_return)
+    if match:
+        return "(" + match.group(1).strip() + ")"
+    return "(" + no_return + ")"
+
 def quote_ident(name: str) -> str:
     # Always double-quote to preserve case and special chars
     q = name.replace('"', '""')
@@ -151,6 +164,11 @@ def _is_timestamp_like_table_name(name: str) -> bool:
         return False
     return name[0].isdigit() and " " in name and ":" in name
 
+def _row_to_dict_with_cols(cols: List[str], row) -> Dict[str, str]:
+    """Build a dict from a row using fixed column names (avoids cursor.description changing after later queries)."""
+    return {c: (str(v) if v is not None else "") for c, v in zip(cols, row)}
+
+
 def export_simple_objects(cur, out_base: pathlib.Path, db: str, schema: str, verbose: bool = True) -> Dict[str, List[str]]:
     """Export tables, views, stages, etc. Returns dict mapping object type -> list of extracted FQ names."""
     extracted: Dict[str, List[str]] = {}
@@ -161,15 +179,18 @@ def export_simple_objects(cur, out_base: pathlib.Path, db: str, schema: str, ver
         except Exception as e:
             print(f"[WARN] SHOW failed: {sql} -> {e}")
             continue
+        # Capture column names and all rows now; later GET_DDL calls overwrite cursor.description
+        cols = [d[0].lower() for d in cur.description] if cur.description else []
+        rows = cur.fetchall()
         out_dir = out_base / "ddl" / subfolder / f"{safe_filename_part(db)}.{safe_filename_part(schema)}"
         ensure_dir(out_dir)
-        for row in cur.fetchall():
-            r = row_to_dict(cur, row)
+        for row in rows:
+            r = _row_to_dict_with_cols(cols, row) if cols else {}
             name = r.get("name") or r.get("tag_name") or r.get("stage_name") or r.get("file_format_name") or ""
+            if not name and row:
+                name = str(row[0])
             if not name:
-                # Fallback to first column if name not found
-                if cur.description and len(cur.description) > 0:
-                    name = str(row[0])
+                continue
             if ddl_type == "TABLE" and _is_timestamp_like_table_name(name):
                 continue  # Skip timestamp-named tables that typically fail GET_DDL
             fq = fq_name(db, schema, name)
@@ -193,11 +214,13 @@ def export_functions(cur, out_base: pathlib.Path, db: str, schema: str, verbose:
     except Exception as e:
         print(f"[WARN] SHOW USER FUNCTIONS failed: {sql} -> {e}")
         return extracted
-    for row in cur.fetchall():
-        r = row_to_dict(cur, row)
+    cols = [d[0].lower() for d in cur.description] if cur.description else []
+    rows = cur.fetchall()
+    for row in rows:
+        r = _row_to_dict_with_cols(cols, row) if cols else row_to_dict(cur, row)
         name = r.get("name", "")
         args = r.get("arguments", "").strip()
-        sig = f"({args})" if args else "()"
+        sig = _signature_for_get_ddl(args)
         fqsig = f"{quote_ident(db)}.{quote_ident(schema)}.{quote_ident(name)}{sig}"
         ddl = safe_get_ddl(cur, "FUNCTION", fqsig)
         if ddl:
@@ -220,14 +243,16 @@ def export_procedures(cur, out_base: pathlib.Path, db: str, schema: str, verbose
     except Exception as e:
         print(f"[WARN] SHOW USER PROCEDURES failed: {sql} -> {e}")
         return extracted
-    for row in cur.fetchall():
-        r = row_to_dict(cur, row)
+    cols = [d[0].lower() for d in cur.description] if cur.description else []
+    rows = cur.fetchall()
+    for row in rows:
+        r = _row_to_dict_with_cols(cols, row) if cols else row_to_dict(cur, row)
         name = r.get("name", "")
         # Skip Snowflake system/built-in procedures (GET_DDL does not support them)
         if name.startswith("SYSTEM$"):
             continue
         args = r.get("arguments", "").strip()
-        sig = f"({args})" if args else "()"
+        sig = _signature_for_get_ddl(args)
         fqsig = f"{quote_ident(db)}.{quote_ident(schema)}.{quote_ident(name)}{sig}"
         ddl = safe_get_ddl(cur, "PROCEDURE", fqsig)
         if ddl:
